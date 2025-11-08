@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Spyder Editor
 
-This is a temporary script file.
-"""
 # scheduling_weights.py
 # -------------------------------------------------------
 # Computes W(i) for each patient using alpha-weighted terms
@@ -200,4 +196,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
 
