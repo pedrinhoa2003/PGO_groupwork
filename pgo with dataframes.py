@@ -268,47 +268,218 @@ while True:
 print("\nFinal assignments:")
 print(df_assignments)
 
+# --------------------------------------------
+# SURGEONS: remaining free minutes per day/shift
+# --------------------------------------------
+# base: one row per surgeon/day/shift with availability
+df_surgeon_free = (
+    df_surgeons[["surgeon_id", "day", "shift", "available"]]
+    .drop_duplicates()
+    .merge(df_surgeon_load[["surgeon_id", "day", "shift", "used_min"]],
+           on=["surgeon_id", "day", "shift"], how="left")
+    .fillna({"used_min": 0})
+)
+
+# capacity is C_PER_SHIFT only if surgeon is available in that block
+df_surgeon_free["cap_min"]  = df_surgeon_free["available"] * C_PER_SHIFT
+df_surgeon_free["free_min"] = (df_surgeon_free["cap_min"] - df_surgeon_free["used_min"]).clip(lower=0)
+
+# utilization guard (avoid division by zero)
+df_surgeon_free["utilization"] = df_surgeon_free.apply(
+    lambda r: (r["used_min"] / r["cap_min"]) if r["cap_min"] > 0 else 0.0, axis=1
+)
+
+df_surgeon_free = df_surgeon_free.sort_values(["surgeon_id", "day", "shift"]).reset_index(drop=True)
+
+print("\nSurgeons — remaining free minutes per day/shift:")
+print(df_surgeon_free.head(12))
 
 
+# --------------------------------------------
+# ROOMS: remaining free minutes per day/shift
+# --------------------------------------------
+# df_capacity already holds current free_min per (room,day,shift)
+df_room_free = df_capacity[["room", "day", "shift", "available", "free_min"]].copy()
+
+# derive used minutes and utilization
+df_room_free["cap_min"]   = df_room_free["available"] * C_PER_SHIFT
+df_room_free["used_min"]  = (df_room_free["cap_min"] - df_room_free["free_min"]).clip(lower=0)
+df_room_free["utilization"] = df_room_free.apply(
+    lambda r: (r["used_min"] / r["cap_min"]) if r["cap_min"] > 0 else 0.0, axis=1
+)
+
+df_room_free = df_room_free.sort_values(["room", "day", "shift"]).reset_index(drop=True)
+
+print("\nRooms — remaining free minutes per day/shift:")
+print(df_room_free.head(12))
 
 
+# ============================================================
+# EXPORT PACK — build all relevant tables and write to Excel
+# ============================================================
+import pandas as pd
+from datetime import datetime
 
+# ---------- 0) helpers ----------
+ts = datetime.now().strftime("%Y%m%d_%H%M")
+xlsx_path = f"or_schedule_export_{ts}.xlsx"
 
+# ---------- 1) Inputs (nice tabular forms) ----------
+# Patients input table (as read)
+inputs_patients = df_patients.sort_values("patient_id").copy()
 
+# Rooms availability (room/day/shift) as 0/1
+inputs_rooms = df_rooms.sort_values(["room", "day", "shift"]).copy()
 
+# Surgeons availability (surgeon/day/shift) as 0/1
+inputs_surgeons = df_surgeons.sort_values(["surgeon_id", "day", "shift"]).copy()
 
+# Optional: matrix-style pivots for human reading
+rooms_av_matrix = inputs_rooms.pivot_table(
+    index=["room", "day"], columns="shift", values="available", aggfunc="first"
+).rename(columns={1:"AM", 2:"PM"}).reset_index()
 
+surgeons_av_matrix = inputs_surgeons.pivot_table(
+    index=["surgeon_id", "day"], columns="shift", values="available", aggfunc="first"
+).rename(columns={1:"AM", 2:"PM"}).reset_index()
 
+# ---------- 2) Assignments enriched ----------
+# Join extra patient info to assignments
+assignments_enriched = df_assignments.merge(
+    df_patients[["patient_id", "surgeon_id", "duration", "priority", "waiting"]],
+    on="patient_id", how="left"
+).sort_values(["day", "shift", "room", "patient_id"])
 
+# Add a simple sequence number per (room,day,shift)
+assignments_enriched["seq_in_block"] = (
+    assignments_enriched.groupby(["room", "day", "shift"]).cumcount() + 1
+)
 
+# ---------- 3) Capacity snapshots (final) ----------
+# Rooms: free/used/utilization after the loop
+rooms_free = df_capacity[["room", "day", "shift", "available", "free_min"]].copy()
+rooms_free["cap_min"] = rooms_free["available"] * C_PER_SHIFT
+rooms_free["used_min"] = (rooms_free["cap_min"] - rooms_free["free_min"]).clip(lower=0)
+rooms_free["utilization"] = rooms_free.apply(
+    lambda r: (r["used_min"] / r["cap_min"]) if r["cap_min"] > 0 else 0.0, axis=1
+)
+rooms_free = rooms_free.sort_values(["room", "day", "shift"]).reset_index(drop=True)
 
+# Surgeons: remaining capacity by day/shift
+surgeons_free = (
+    df_surgeons[["surgeon_id", "day", "shift", "available"]]
+    .drop_duplicates()
+    .merge(df_surgeon_load[["surgeon_id", "day", "shift", "used_min"]],
+           on=["surgeon_id", "day", "shift"], how="left")
+    .fillna({"used_min": 0})
+)
+surgeons_free["cap_min"]  = surgeons_free["available"] * C_PER_SHIFT
+surgeons_free["free_min"] = (surgeons_free["cap_min"] - surgeons_free["used_min"]).clip(lower=0)
+surgeons_free["utilization"] = surgeons_free.apply(
+    lambda r: (r["used_min"] / r["cap_min"]) if r["cap_min"] > 0 else 0.0, axis=1
+)
+surgeons_free = surgeons_free.sort_values(["surgeon_id", "day", "shift"]).reset_index(drop=True)
 
+# ---------- 4) KPIs / summaries ----------
+# Per-day KPIs (rooms)
+kpi_day_rooms = rooms_free.groupby("day", as_index=False).agg(
+    open_blocks=("available", "sum"),
+    cap_min=("cap_min", "sum"),
+    used_min=("used_min", "sum"),
+    free_min=("free_min", "sum")
+)
+kpi_day_rooms["utilization"] = kpi_day_rooms.apply(
+    lambda r: (r["used_min"] / r["cap_min"]) if r["cap_min"] > 0 else 0.0, axis=1
+)
 
+# Per-room KPIs (across all days/shifts)
+kpi_room = rooms_free.groupby("room", as_index=False).agg(
+    open_blocks=("available", "sum"),
+    cap_min=("cap_min", "sum"),
+    used_min=("used_min", "sum"),
+    free_min=("free_min", "sum")
+)
+kpi_room["utilization"] = kpi_room.apply(
+    lambda r: (r["used_min"] / r["cap_min"]) if r["cap_min"] > 0 else 0.0, axis=1
+)
 
+# Per-surgeon KPIs
+kpi_surgeon = surgeons_free.groupby("surgeon_id", as_index=False).agg(
+    open_blocks=("available", "sum"),
+    cap_min=("cap_min", "sum"),
+    used_min=("used_min", "sum"),
+    free_min=("free_min", "sum")
+)
+kpi_surgeon["utilization"] = kpi_surgeon.apply(
+    lambda r: (r["used_min"] / r["cap_min"]) if r["cap_min"] > 0 else 0.0, axis=1
+)
 
+# Global KPIs
+total_cap = rooms_free["cap_min"].sum()
+total_used = rooms_free["used_min"].sum()
+total_free = rooms_free["free_min"].sum()
+global_util = (total_used / total_cap) if total_cap > 0 else 0.0
+n_assigned = len(assignments_enriched)
+n_unassigned = len(df_patients) - n_assigned
 
+kpi_global = pd.DataFrame([{
+    "total_capacity_min": total_cap,
+    "total_used_min": total_used,
+    "total_free_min": total_free,
+    "global_utilization": global_util,
+    "assigned_patients": n_assigned,
+    "unassigned_patients": n_unassigned
+}])
 
+# ---------- 5) Unassigned patients ----------
+# remaining holds the patients not scheduled by the loop
+unassigned_patients = remaining.sort_values("patient_id").copy() if len(remaining) else pd.DataFrame(
+    columns=df_patients.columns
+)
 
+# Optional: show their feasible blocks at the end (static view)
+# (Rebuild Step-1 static feasibility just for these)
+if len(unassigned_patients):
+    blocks_open = df_rooms[df_rooms["available"] == 1][["room", "day", "shift"]].drop_duplicates()
+    surg_open   = df_surgeons[df_surgeons["available"] == 1][["surgeon_id", "day", "shift"]].drop_duplicates()
+    pmini_u = unassigned_patients[["patient_id", "surgeon_id", "duration"]].copy()
+    ptime_u = pmini_u.merge(surg_open, on="surgeon_id", how="inner")
+    pblocks_u = ptime_u.merge(blocks_open, on=["day", "shift"], how="inner")
+    pblocks_u["fits_shift"] = (pblocks_u["duration"] + CLEANUP) <= C_PER_SHIFT
+    pblocks_u = pblocks_u[pblocks_u["fits_shift"]]
+    feas_u = (pblocks_u.groupby("patient_id", as_index=False)
+                        .agg(feasible_blocks=("room", "count")))
+    unassigned_patients = unassigned_patients.merge(feas_u, on="patient_id", how="left").fillna({"feasible_blocks":0})
 
+# ---------- 6) Final block state (for audit) ----------
+# One row per (room, day, shift) with remaining minutes (already in rooms_free)
+# Join how many cases were assigned in each block
+cases_per_block = (assignments_enriched.groupby(["room","day","shift"], as_index=False)
+                                  .size().rename(columns={"size":"n_cases"}))
+final_blocks = rooms_free.merge(cases_per_block, on=["room","day","shift"], how="left").fillna({"n_cases":0})
 
+# ---------- 7) Write everything to Excel ----------
+with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+    # Inputs
+    inputs_patients.to_excel(writer, sheet_name="Inputs_Patients", index=False)
+    inputs_rooms.to_excel(writer, sheet_name="Inputs_Rooms", index=False)
+    inputs_surgeons.to_excel(writer, sheet_name="Inputs_Surgeons", index=False)
+    rooms_av_matrix.to_excel(writer, sheet_name="Rooms_Availability_Matrix", index=False)
+    surgeons_av_matrix.to_excel(writer, sheet_name="Surgeons_Availability_Matrix", index=False)
 
+    # Results
+    assignments_enriched.to_excel(writer, sheet_name="Assignments", index=False)
+    final_blocks.to_excel(writer, sheet_name="Blocks_FinalState", index=False)
+    rooms_free.to_excel(writer, sheet_name="Rooms_Free", index=False)
+    surgeons_free.to_excel(writer, sheet_name="Surgeons_Free", index=False)
 
+    # KPIs
+    kpi_global.to_excel(writer, sheet_name="KPI_Global", index=False)
+    kpi_day_rooms.to_excel(writer, sheet_name="KPI_PerDay", index=False)
+    kpi_room.to_excel(writer, sheet_name="KPI_PerRoom", index=False)
+    kpi_surgeon.to_excel(writer, sheet_name="KPI_PerSurgeon", index=False)
 
+    # Unassigned (if any)
+    unassigned_patients.to_excel(writer, sheet_name="Unassigned", index=False)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+print(f"\nExcel exported → {xlsx_path}")
