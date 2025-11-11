@@ -141,8 +141,8 @@ def score_block_for_patient(cand_df, patient_row, n_days):
     return df.sort_values("W_block", ascending=False)
 
 
-def commit_assignment(patient_row, best_row):
-    """Update capacity, surgeon-load, and assignments after scheduling."""
+def commit_assignment(patient_row, best_row, iteration, w_patient=None, w_block=None):
+    """Update capacity, surgeon-load, and record assignment with iteration order."""
     pid = int(patient_row["patient_id"])
     sid = int(patient_row["surgeon_id"])
     dur_need = int(patient_row["duration"]) + CLEANUP
@@ -156,15 +156,23 @@ def commit_assignment(patient_row, best_row):
     idx_s = (df_surgeon_load["surgeon_id"] == sid) & (df_surgeon_load["day"] == d) & (df_surgeon_load["shift"] == sh)
     df_surgeon_load.loc[idx_s, "used_min"] += dur_need
 
-    # record assignment
+    # record assignment (store iteration and optional scores)
     df_assignments.loc[len(df_assignments)] = {
-        "patient_id": pid, "room": r, "day": d, "shift": sh,
-        "used_min": dur_need, "surgeon_id": sid
+        "patient_id": pid,
+        "room": r,
+        "day": d,
+        "shift": sh,
+        "used_min": dur_need,
+        "surgeon_id": sid,
+        "iteration": int(iteration),
+        "W_patient": float(w_patient) if w_patient is not None else None,
+        "W_block": float(w_block) if w_block is not None else None,
     }
 
 
+
 def deadline_limit_from_priority(p):
-    return 15 if p == 2 else (270 if p == 1 else None)
+    return 3 if p==3 else (15 if p == 2 else (90 if p == 1 else 270))
 
 def deadline_term(priority, waited):
     lim = deadline_limit_from_priority(priority)
@@ -179,7 +187,7 @@ def deadline_term(priority, waited):
 df_capacity = df_rooms.copy()
 df_capacity["free_min"] = df_capacity["available"].apply(lambda a: C_PER_SHIFT if a == 1 else 0)
 
-df_assignments = pd.DataFrame(columns=["patient_id", "room", "day", "shift", "used_min", "surgeon_id"])
+df_assignments = pd.DataFrame(columns=["patient_id", "room", "day", "shift", "used_min", "surgeon_id", "iteration", "W_patient", "W_block"])
 
 df_surgeon_load = df_surgeons[["surgeon_id", "day", "shift"]].drop_duplicates().assign(used_min=0)
 
@@ -253,8 +261,17 @@ while True:
     scored = score_block_for_patient(cand_blocks, patient_row, n_days=n_days)
     best_block = scored.iloc[0]
 
-    # commit assignment
-    commit_assignment(patient_row, best_block)
+    # commit assignment and store iteration
+    patient_row = patient_row.copy()
+    patient_row["iteration"] = iteration
+    commit_assignment(
+        patient_row,
+        best_block,
+        iteration=iteration,
+        w_patient=float(patient_row["W_patient"]),
+        w_block=float(best_block["W_block"])
+    )
+
 
     # remove scheduled patient
     remaining = remaining[remaining["patient_id"] != patient_row["patient_id"]]
@@ -348,7 +365,8 @@ surgeons_av_matrix = inputs_surgeons.pivot_table(
 assignments_enriched = df_assignments.merge(
     df_patients[["patient_id", "surgeon_id", "duration", "priority", "waiting"]],
     on="patient_id", how="left"
-).sort_values(["day", "shift", "room", "patient_id"])
+).sort_values("iteration")
+
 
 # Add a simple sequence number per (room,day,shift)
 assignments_enriched["seq_in_block"] = (
