@@ -95,17 +95,18 @@ df_surgeons = pd.DataFrame(rows)
 # STEP 2 SUPPORT FUNCTIONS
 # ------------------------------
 def feasible_blocks_step2(patient_row):
-    """Return feasible (room, day, shift) given current capacity & surgeon load."""
+    """Return feasible (room, day, shift) given current capacity & surgeon load.
+       Scenario 1: if surgeon already assigned in (day, shift), he must stay in the same room."""
     sid = int(patient_row["surgeon_id"])
     need = int(patient_row["duration"]) + CLEANUP
 
     # surgeon available (day, shift)
     surg_ok = df_surgeons[(df_surgeons["surgeon_id"] == sid) &
-                          (df_surgeons["available"] == 1)][["day", "shift"]]
+                          (df_surgeons["available"] == 1)][["day", "shift"]].drop_duplicates()
 
     # rooms open with enough capacity
     cap_ok = df_capacity[(df_capacity["available"] == 1) &
-                         (df_capacity["free_min"] >= need)][["room", "day", "shift", "free_min"]]
+                         (df_capacity["free_min"] >= need)][["room", "day", "shift", "free_min"]].drop_duplicates()
 
     cand = surg_ok.merge(cap_ok, on=["day", "shift"], how="inner")
 
@@ -114,17 +115,26 @@ def feasible_blocks_step2(patient_row):
     cand = cand.merge(surg_load, on=["day", "shift"], how="left").fillna({"used_min": 0})
     cand = cand[(cand["used_min"] + need) <= C_PER_SHIFT]
 
-    # continuity flag (already operating in same block)
+    # ---- Scenario 1: room lock per (surgeon, day, shift) ----
     if len(df_assignments) > 0:
-        cont = df_assignments[df_assignments["surgeon_id"] == sid][["room", "day", "shift"]].copy()
+        # room already used by this surgeon on that (day, shift)
+        locks = (df_assignments[df_assignments["surgeon_id"] == sid]
+                 .loc[:, ["day", "shift", "room"]]
+                 .drop_duplicates()
+                 .rename(columns={"room": "room_locked"}))
+        cand = cand.merge(locks, on=["day", "shift"], how="left")
+        # if there is a locked room, restrict to it
+        cand = cand[(cand["room_locked"].isna()) | (cand["room"] == cand["room_locked"])]
+        cand = cand.drop(columns=["room_locked"])
+
+        # continuity = 1 iff already operating in that same block
+        cont = df_assignments[df_assignments["surgeon_id"] == sid][["room", "day", "shift"]].drop_duplicates()
         cont["continuity"] = 1
         cand = cand.merge(cont, on=["room", "day", "shift"], how="left")
+        cand["continuity"] = cand["continuity"].fillna(0).astype(int)
     else:
         cand["continuity"] = 0
 
-    cand["continuity"] = cand["continuity"].fillna(0).astype(int)
-    print(f"surgeon: {sid}, need: {need}")
-    print(cand)
     return cand
 
 
@@ -222,9 +232,24 @@ while True:
     df_p_blocks = df_p_cap[(df_p_cap["free_min"] >= df_p_cap["need"]) &
                            ((df_p_cap["used_min"] + df_p_cap["need"]) <= C_PER_SHIFT)]
     
-    # count feasible blocks per patient
-    df_feas_count = (df_p_blocks.groupby("patient_id", as_index=False)
-                                .agg(feasible_blocks=("room","count")))
+    # ---- Scenario 1 lock in Step 1: if surgeon already has a room in that (day, shift), restrict to it
+    if len(df_assignments) > 0:
+        locks_all = (
+            df_assignments.loc[:, ["surgeon_id", "day", "shift", "room"]]
+            .drop_duplicates()
+            .rename(columns={"room": "room_locked"})
+        )
+        df_p_blocks = df_p_blocks.merge(locks_all, on=["surgeon_id", "day", "shift"], how="left")
+        df_p_blocks = df_p_blocks[(df_p_blocks["room_locked"].isna()) |
+                                  (df_p_blocks["room"] == df_p_blocks["room_locked"])]
+        df_p_blocks = df_p_blocks.drop(columns=["room_locked"])
+    
+    # count feasible blocks per patient (already respecting the lock)
+    df_feas_count = (
+        df_p_blocks.groupby("patient_id", as_index=False)
+                   .agg(feasible_blocks=("room", "count"))
+    )
+
     
     step1 = df_pmini.merge(df_feas_count, on="patient_id", how="left").fillna({"feasible_blocks":0})
 
@@ -363,7 +388,7 @@ surgeons_av_matrix = inputs_surgeons.pivot_table(
 # ---------- 2) Assignments enriched ----------
 # Join extra patient info to assignments
 assignments_enriched = df_assignments.merge(
-    df_patients[["patient_id", "surgeon_id", "duration", "priority", "waiting"]],
+    df_patients[["patient_id", "duration", "priority", "waiting"]],
     on="patient_id", how="left"
 ).sort_values("iteration")
 
@@ -372,6 +397,35 @@ assignments_enriched = df_assignments.merge(
 assignments_enriched["seq_in_block"] = (
     assignments_enriched.groupby(["room", "day", "shift"]).cumcount() + 1
 )
+
+# --------------------------------------------
+# Dict: {"R#_D#_S#": {"surgeon": id, "patients": [ ... ]}}
+# --------------------------------------------
+ordered = assignments_enriched.sort_values(["day", "shift", "room", "iteration"])
+
+schedule_by_block = {}
+for (r, d, s), g in ordered.groupby(["room", "day", "shift"], sort=True):
+    key = f"R{int(r)}_D{int(d)}_S{int(s)}"
+    surgeon_id = int(g["surgeon_id"].iloc[0]) if len(g) else None  # cenário 1: 1 cirurgião por bloco
+    schedule_by_block[key] = {
+        "surgeon": surgeon_id,
+        "patients": [int(p) for p in g["patient_id"].tolist()]
+    }
+
+# --------------------------------------------
+# Pretty-print solution by block
+# --------------------------------------------
+print("\n===== FINAL SCHEDULE BY BLOCK =====")
+for key, val in sorted(schedule_by_block.items()):
+    r = int(key.split("_")[0][1:])
+    d = int(key.split("_")[1][1:])
+    s = int(key.split("_")[2][1:])
+    surgeon_id = val["surgeon"]
+    patients_str = ", ".join(f"P{p}" for p in val["patients"])
+    print(f"Room {r}, Day {d}, Shift {s} — Surgeon {surgeon_id} → {patients_str}")
+
+print("===================================")
+
 
 # ---------- 3) Capacity snapshots (final) ----------
 # Rooms: free/used/utilization after the loop
