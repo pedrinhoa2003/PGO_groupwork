@@ -363,7 +363,7 @@ surgeons_av_matrix = inputs_surgeons.pivot_table(
 # ---------- 2) Assignments enriched ----------
 # Join extra patient info to assignments
 assignments_enriched = df_assignments.merge(
-    df_patients[["patient_id", "surgeon_id", "duration", "priority", "waiting"]],
+    df_patients[["patient_id", "duration", "priority", "waiting"]],
     on="patient_id", how="left"
 ).sort_values("iteration")
 
@@ -499,5 +499,46 @@ with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
 
     # Unassigned (if any)
     unassigned_patients.to_excel(writer, sheet_name="Unassigned", index=False)
+
+# ---------- 8) TEXT-BASED SCHEDULE (for console & text file) ----------
+print("\n================= FINAL TEXT SCHEDULE =================\n")
+
+# only proceed if we have some assignments
+if len(assignments_enriched) == 0:
+    print("(No assignments found — nothing to display.)")
+else:
+    INCLUDE_CLEANUP_IN_TIMELINE = False  # change to True if you want cleanup gaps between surgeries
+
+    # Sort cases for consistent block order
+    assignments_sorted = assignments_enriched.sort_values(
+        ["room", "day", "shift", "seq_in_block", "iteration"]
+    )
+
+    blocks = []
+    for (r, d, sh), group in assignments_sorted.groupby(["room", "day", "shift"], sort=True):
+        entries = []
+        t = 0  # time tracker within the shift
+        for _, row in group.iterrows():
+            pid = int(row["patient_id"])
+            sid = int(row["surgeon_id"])
+            dur = int(row["duration"])
+            start = t
+            end = t + dur
+            entries.append(f"   (p={pid}, s={sid}, dur={dur}, start={start}, end={end})")
+            t = end + (CLEANUP if INCLUDE_CLEANUP_IN_TIMELINE else 0)
+
+        if entries:
+            header = f"B_{r}_{d}_{sh}:"
+            block_text = header + "\n" + "\n".join(entries)
+            blocks.append(block_text)
+
+    # Combine all blocks
+    schedule_text = "\n\n".join(blocks)
+    print(schedule_text)
+    Path("schedule_text_output.txt").write_text(schedule_text, encoding="utf-8")
+    print("\nSchedule saved to: schedule_text_output.txt")
+
+print("\n========================================================\n")
+
 
 print(f"\nExcel exported → {xlsx_path}")

@@ -12,7 +12,7 @@ import pandas as pd
 # ------------------------------
 # PARAMETERS
 # ------------------------------
-DATA_FILE = "instance_c1_30.dat"
+DATA_FILE = "Instance_CAT_30.dat"
 
 C_PER_SHIFT = 360   # minutes per shift (6h * 60)
 CLEANUP = 17        # cleaning time
@@ -21,6 +21,8 @@ ALPHA1 = 0.45  # priority
 ALPHA2 = 0.15  # waited days
 ALPHA3 = 0.35  # deadline closeness
 ALPHA4 = 0.05  # feasible blocks
+
+TOLERANCE = 15  # NEW- tolerance minutes to pass the capacity of the shift
 
 
 # ------------------------------
@@ -220,7 +222,13 @@ while True:
     
     # keep only blocks that can host the case now
     df_p_blocks = df_p_cap[(df_p_cap["free_min"] >= df_p_cap["need"]) &
-                           ((df_p_cap["used_min"] + df_p_cap["need"]) <= C_PER_SHIFT)]
+                           ((df_p_cap["used_min"] + df_p_cap["need"]) <= C_PER_SHIFT + TOLERANCE)] # NEW
+    # to see where was the overflow
+    df_p_blocks["overflow_min"] = (
+    (df_p_cap["used_min"] + df_p_cap["need"]) - C_PER_SHIFT).clip(lower=0) 
+    #overflow_min = 0 if is within the limits
+    #overflow_min = 2 if passes 2 minutes...
+
     
     # count feasible blocks per patient
     df_feas_count = (df_p_blocks.groupby("patient_id", as_index=False)
@@ -363,7 +371,7 @@ surgeons_av_matrix = inputs_surgeons.pivot_table(
 # ---------- 2) Assignments enriched ----------
 # Join extra patient info to assignments
 assignments_enriched = df_assignments.merge(
-    df_patients[["patient_id", "duration", "priority", "waiting"]],
+    df_patients[["patient_id", "surgeon_id", "duration", "priority", "waiting"]],
     on="patient_id", how="left"
 ).sort_values("iteration")
 
@@ -372,6 +380,8 @@ assignments_enriched = df_assignments.merge(
 assignments_enriched["seq_in_block"] = (
     assignments_enriched.groupby(["room", "day", "shift"]).cumcount() + 1
 )
+
+
 
 # ---------- 3) Capacity snapshots (final) ----------
 # Rooms: free/used/utilization after the loop
@@ -500,45 +510,102 @@ with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
     # Unassigned (if any)
     unassigned_patients.to_excel(writer, sheet_name="Unassigned", index=False)
 
-# ---------- 8) TEXT-BASED SCHEDULE (for console & text file) ----------
-print("\n================= FINAL TEXT SCHEDULE =================\n")
-
-# only proceed if we have some assignments
-if len(assignments_enriched) == 0:
-    print("(No assignments found — nothing to display.)")
-else:
-    INCLUDE_CLEANUP_IN_TIMELINE = False  # change to True if you want cleanup gaps between surgeries
-
-    # Sort cases for consistent block order
-    assignments_sorted = assignments_enriched.sort_values(
-        ["room", "day", "shift", "seq_in_block", "iteration"]
-    )
-
-    blocks = []
-    for (r, d, sh), group in assignments_sorted.groupby(["room", "day", "shift"], sort=True):
-        entries = []
-        t = 0  # time tracker within the shift
-        for _, row in group.iterrows():
-            pid = int(row["patient_id"])
-            sid = int(row["surgeon_id"])
-            dur = int(row["duration"])
-            start = t
-            end = t + dur
-            entries.append(f"   (p={pid}, s={sid}, dur={dur}, start={start}, end={end})")
-            t = end + (CLEANUP if INCLUDE_CLEANUP_IN_TIMELINE else 0)
-
-        if entries:
-            header = f"B_{r}_{d}_{sh}:"
-            block_text = header + "\n" + "\n".join(entries)
-            blocks.append(block_text)
-
-    # Combine all blocks
-    schedule_text = "\n\n".join(blocks)
-    print(schedule_text)
-    Path("schedule_text_output.txt").write_text(schedule_text, encoding="utf-8")
-    print("\nSchedule saved to: schedule_text_output.txt")
-
-print("\n========================================================\n")
-
-
 print(f"\nExcel exported → {xlsx_path}")
+
+# ============================================================
+# ITERATED LOCAL SEARCH (improvement step)
+# ============================================================
+import random
+import numpy as np
+
+print("\nStarting Iterated Local Search (ILS)...")
+
+assignments_enriched["used_min"] = assignments_enriched["duration"] + CLEANUP
+assignments_enriched["overflow_min"] = (
+    assignments_enriched.groupby(["room","day","shift"])["used_min"].transform("sum") - C_PER_SHIFT
+).clip(lower=0)
+
+
+
+# --- Evalution Function ---
+def deadline_limit_from_priority(p):
+    #Return maximum allowed waiting days based on patient priority."""
+    return 3 if p == 3 else (15 if p == 2 else (90 if p == 1 else 270))
+
+def penalty_deadline(priority, waiting):
+
+    #Compute penalty if the patient exceeds the maximum allowed waiting time.
+    #The penalty grows linearly with delay days beyond the allowed limit.
+    lim = deadline_limit_from_priority(priority)
+    if waiting <= lim:
+        return 0.0
+    delay = waiting - lim
+    return 0.001 * delay  # adjust multiplier to tune penalty weight
+
+def evaluate_solution(df):
+   
+    total_used = df["used_min"].sum()
+    total_blocks = df[["room","day","shift"]].drop_duplicates().shape[0]
+    total_cap = total_blocks * C_PER_SHIFT
+    utilization = total_used / total_cap if total_cap > 0 else 0
+
+    # --- 2) Penalty: overflow exceeding the time of the shift ---
+    overflow = df["overflow_min"].sum()
+    penalty_overflow = 0.002 * overflow  # 0.002 por minuto acima do limite
+
+    # --- 3) Penalty: exceeding the max waiting time---
+    penalty_dead = 0.0
+    for _, row in df.iterrows():
+        penalty_dead += penalty_deadline(row["priority"], row["waiting"])
+
+    # --- 4) Score final ---
+    score = utilization - (penalty_overflow + penalty_dead)
+    return score
+
+    
+# --- Move: Change 2 patients between blocks ---
+def local_move(df):
+    new = df.copy()
+    if len(new) < 2:
+        return new
+
+    # escolher dois pacientes aleatórios
+    i, j = random.sample(range(len(new)), 2)
+    pid1 = new.iloc[i]["patient_id"]
+    pid2 = new.iloc[j]["patient_id"]
+
+    # guardar blocos atuais
+    block1 = new.loc[new["patient_id"] == pid1, ["room", "day", "shift"]].iloc[0]
+    block2 = new.loc[new["patient_id"] == pid2, ["room", "day", "shift"]].iloc[0]
+
+    # trocar
+    new.loc[new["patient_id"] == pid1, ["room", "day", "shift"]] = block2.values
+    new.loc[new["patient_id"] == pid2, ["room", "day", "shift"]] = block1.values
+
+    # recalcular overflow
+    new["used_min"] = new["duration"] + CLEANUP
+    new["overflow_min"] = (
+        new.groupby(["room","day","shift"])["used_min"].transform("sum") - C_PER_SHIFT
+    ).clip(lower=0)
+
+    return new
+
+
+# --- ILS loop ---
+best = assignments_enriched.copy()
+best_score = evaluate_solution(best)
+print(f"Initial score = {best_score:.4f}")
+
+for it in range(50):
+    candidate = local_move(best)
+    cand_score = evaluate_solution(candidate)
+    if cand_score > best_score:
+        best = candidate.copy()
+        best_score = cand_score
+        print(f"Iteration {it+1}: improved → {best_score:.4f}")
+
+print(f"Final improved score = {best_score:.4f}")
+print("ILS finished.\n")
+
+# If we want to export the new better result:
+# best.to_excel("or_schedule_improved.xlsx", index=False)
