@@ -17,10 +17,10 @@ DATA_FILE = "instance_c1_30.dat"
 C_PER_SHIFT = 360   # minutes per shift (6h * 60)
 CLEANUP = 17        # cleaning time
 
-ALPHA1 = 0.45  # priority
-ALPHA2 = 0.15  # waited days
-ALPHA3 = 0.35  # deadline closeness
-ALPHA4 = 0.05  # feasible blocks
+ALPHA1 = 0.25  # priority
+ALPHA2 = 0.25  # waited days
+ALPHA3 = 0.25  # deadline closeness
+ALPHA4 = 0.25  # feasible blocks
 
 TOLERANCE = 15  # NEW- tolerance minutes to pass the capacity of the shift
 

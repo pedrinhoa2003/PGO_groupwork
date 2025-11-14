@@ -23,7 +23,7 @@ ALPHA2 = 0.25  # waited days
 ALPHA3 = 0.25  # deadline closeness
 ALPHA4 = 0.25  # feasible blocks
 
-
+TOLERANCE = 15  #NEW
 # ------------------------------
 # FILE READING UTILITIES
 # ------------------------------
@@ -287,6 +287,202 @@ def evaluate_schedule(assignments, patients, rooms_free, weights=(0.4, 0.3, 0.2,
             "norm_wait_term":float(norm_wait_term)}
 
 
+# LOCAL SEARCH NEW
+import random
+
+def candidate_blocks_for_patient_in_solution(assignments, patient_row,
+                                             df_rooms, df_surgeons, C_PER_SHIFT):
+    sid = int(patient_row["surgeon_id"])
+    need = int(patient_row["duration"]) + CLEANUP
+
+    # disponibilidade do cirurgião
+    surg_ok = df_surgeons[
+        (df_surgeons["surgeon_id"] == sid) & (df_surgeons["available"] == 1)
+    ][["day","shift"]]
+
+    # capacidade por bloco (a partir do assignments atual)
+    rooms_base = df_rooms[["room","day","shift","available"]].copy()
+    rooms_base["cap_min"] = rooms_base["available"] * C_PER_SHIFT
+
+    if len(assignments):
+        used_by_block = (assignments.groupby(["room","day","shift"], as_index=False)
+                         .agg(used_min=("used_min","sum")))
+    else:
+        used_by_block = rooms_base[["room","day","shift"]].copy()
+        used_by_block["used_min"] = 0
+
+    rooms_join = rooms_base.merge(used_by_block, on=["room","day","shift"], how="left").fillna({"used_min": 0})
+    rooms_join["free_min"] = (rooms_join["cap_min"] - rooms_join["used_min"]).clip(lower=0)
+
+    cap_ok = rooms_join[(rooms_join["available"] == 1) & (rooms_join["free_min"] >= need)][["room","day","shift","free_min"]]
+
+    cand = surg_ok.merge(cap_ok, on=["day","shift"], how="inner")
+
+    # carga do cirurgião por (day,shift)
+    if len(assignments):
+        sload = (assignments[assignments["surgeon_id"] == sid]
+                 .groupby(["day","shift"], as_index=False)
+                 .agg(used_min=("used_min","sum")))
+    else:
+        sload = pd.DataFrame(columns=["day","shift","used_min"])
+
+    cand = cand.merge(sload, on=["day","shift"], how="left").fillna({"used_min": 0})
+    cand = cand[(cand["used_min"] + need) <= C_PER_SHIFT]
+
+    # NOTE: **NO ROOM-LOCK**: we intentionally do NOT restrict to same room
+    return cand
+
+
+def swap_with_unassigned_random(assignments, patients, df_rooms, df_surgeons, C_PER_SHIFT):
+    if assignments.empty:
+        return assignments, False
+
+    new_assign = assignments.copy()
+    scheduled_ids = set(new_assign["patient_id"])
+    unassigned = patients[~patients["patient_id"].isin(scheduled_ids)]
+    if unassigned.empty:
+        return assignments, False
+
+    # escolher NÃO agendado aleatório
+    u_row = unassigned.sample(1).iloc[0]
+    u_id = int(u_row["patient_id"])
+    u_sid = int(u_row["surgeon_id"])
+    need = int(u_row["duration"]) + CLEANUP
+
+    surg_ok = df_surgeons[(df_surgeons["surgeon_id"] == u_sid) & (df_surgeons["available"] == 1)][["day","shift"]]
+
+    rooms_base = df_rooms[["room","day","shift","available"]].copy()
+    rooms_base["cap_min"] = rooms_base["available"] * C_PER_SHIFT
+
+    used_by_block = new_assign.groupby(["room","day","shift"], as_index=False).agg(used_min=("used_min","sum"))
+    rooms_join = rooms_base.merge(used_by_block, on=["room","day","shift"], how="left").fillna({"used_min": 0})
+    rooms_join["free_min"] = (rooms_join["cap_min"] - rooms_join["used_min"]).clip(lower=0)
+
+    cand_blocks = surg_ok.merge(rooms_join[rooms_join["available"]==1][["room","day","shift","used_min","cap_min","free_min"]],
+                                on=["day","shift"], how="inner")
+    if cand_blocks.empty:
+        return assignments, False
+
+    # escolher bloco aleatório
+    b = cand_blocks.sample(1).iloc[0]
+    r, d, sh = int(b["room"]), int(b["day"]), int(b["shift"])
+
+    in_block = new_assign[(new_assign["room"]==r) & (new_assign["day"]==d) & (new_assign["shift"]==sh)].merge(
+        patients[["patient_id","priority","waiting","duration"]], on="patient_id", how="left"
+    )
+
+    if in_block.empty:
+        return assignments, False
+
+    out_row = in_block.sample(1).iloc[0]
+    out_id = int(out_row["patient_id"])
+    out_dur = int(out_row["duration"]) + CLEANUP
+
+    used_now = int(b["used_min"])
+    cap = int(b["cap_min"])
+    if used_now - out_dur + need > cap:
+        return assignments, False
+    print(
+    f"[LS] Swap tentado: OUT P{out_id} (dur={out_dur})  ←→  "
+    f"IN P{u_id} (dur={need})  "
+    f"no bloco B_{r}_{d}_{sh}"
+)
+
+    
+    # apply change
+    new_assign = new_assign[new_assign["patient_id"] != out_id].copy()
+    new_assign = pd.concat([
+        new_assign,
+        pd.DataFrame([{
+            "patient_id": u_id,
+            "room": r,
+            "day": d,
+            "shift": sh,
+            "used_min": need,
+            "surgeon_id": u_sid,
+            "iteration": new_assign["iteration"].max() + 1 if len(new_assign) else 1,
+            "W_patient": None,
+            "W_block": None
+        }])
+    ], ignore_index=True)
+
+    new_assign = new_assign.sort_values(["day","shift","room","iteration"]).reset_index(drop=True)
+    return new_assign, True
+
+
+def local_search_iterated(assign_init, df_rooms, df_surgeons, patients, C_PER_SHIFT, max_no_improv=200):
+    current = assign_init.copy()
+
+    # avaliar inicial
+    rooms_base = df_rooms[["room","day","shift","available"]].copy()
+    rooms_base["cap_min"] = rooms_base["available"] * C_PER_SHIFT
+    if len(current):
+        used_by_block = (current.groupby(["room","day","shift"], as_index=False)
+                         .agg(used_min=("used_min","sum")))
+    else:
+        used_by_block = rooms_base[["room","day","shift"]].copy().assign(used_min=0)
+    rooms_join = rooms_base.merge(used_by_block, on=["room","day","shift"], how="left").fillna({"used_min":0})
+    rooms_join["used_min"] = rooms_join["used_min"].clip(lower=0)
+    rooms_join["utilization"] = rooms_join.apply(lambda r: (r["used_min"]/r["cap_min"]) if r["cap_min"]>0 else 0.0, axis=1)
+
+    feas = feasibility_metrics(current, df_rooms, df_surgeons, patients, C_PER_SHIFT)
+    best_feas = feas["feasibility_score"]
+    if best_feas == 0:
+        best_score = evaluate_schedule(current, patients, rooms_join)["score"]
+    else:
+        best_score = -best_feas
+
+    print(f"\nLS START — score inicial={best_score:.4f}, infeas={best_feas}")
+
+    no_improv = 0
+    ls_iter = 0
+
+    while no_improv < max_no_improv:
+        ls_iter += 1
+
+        candidate, moved = swap_with_unassigned_random(current, patients, df_rooms, df_surgeons, C_PER_SHIFT)
+        if not moved:
+            no_improv += 1
+            continue
+
+        feas_c = feasibility_metrics(candidate, df_rooms, df_surgeons, patients, C_PER_SHIFT)
+
+        rooms_base = df_rooms[["room","day","shift","available"]].copy()
+        rooms_base["cap_min"] = rooms_base["available"] * C_PER_SHIFT
+        if len(candidate):
+            used_by_block = (candidate.groupby(["room","day","shift"], as_index=False)
+                             .agg(used_min=("used_min","sum")))
+        else:
+            used_by_block = rooms_base[["room","day","shift"]].copy().assign(used_min=0)
+        rooms_join_c = rooms_base.merge(used_by_block, on=["room","day","shift"], how="left").fillna({"used_min":0})
+        rooms_join_c["used_min"] = rooms_join_c["used_min"].clip(lower=0)
+        rooms_join_c["utilization"] = rooms_join_c.apply(lambda r: (r["used_min"]/r["cap_min"]) if r["cap_min"]>0 else 0.0, axis=1)
+
+        if feas_c["feasibility_score"] == 0:
+            cand_score = evaluate_schedule(candidate, patients, rooms_join_c)["score"]
+        else:
+            cand_score = -feas_c["feasibility_score"]
+
+        # este é o print do Cenário 1
+        print(f"LS ITER {ls_iter:03d} — score {best_score:.4f} → {cand_score:.4f}")
+
+        if cand_score > best_score:
+            print("   ✓ melhoria — movimento aceite")
+            current = candidate
+            best_score = cand_score
+            best_feas = feas_c["feasibility_score"]
+            no_improv = 0
+        else:
+            print("   ✗ não melhora — rejeitado")
+            no_improv += 1
+
+    print(f"\nLS END — melhor score={best_score:.4f}")
+    return current, best_score, best_feas
+
+
+
+
+
 # ------------------------------
 # INITIAL PLANNING STATE
 # ------------------------------
@@ -349,9 +545,14 @@ while True:
     
     # keep only blocks that can host the case now
     df_p_blocks = df_p_cap[
-        (df_p_cap["free_min"] >= df_p_cap["need"]) &
-        ((df_p_cap["used_min"] + df_p_cap["need"]) <= C_PER_SHIFT)
+    (df_p_cap["free_min"] >= df_p_cap["need"]) &
+    ((df_p_cap["used_min"] + df_p_cap["need"]) <= C_PER_SHIFT + TOLERANCE) #NEW
     ]
+
+    # how many time goes over the C_PER_SHIFT (0 if it doesn't) NEW
+    df_p_blocks["overflow_min"] = (
+        (df_p_cap["used_min"] + df_p_cap["need"]) - C_PER_SHIFT
+    ).clip(lower=0)
     
     # count feasible blocks per patient
     df_feas_count = (
@@ -432,6 +633,45 @@ while True:
 
 print("\nFinal assignments:")
 print(df_assignments)
+
+# ========================
+# LOCAL SEARCH ITERATED NEW
+# ========================
+print("\n>> Running local search iterated (swap_with_unassigned_random only)...")
+best_assignments, best_score, best_feas = local_search_iterated(
+    df_assignments, df_rooms, df_surgeons, df_patients, C_PER_SHIFT, max_no_improv=200
+)
+
+print("\nLocal search finished:",
+      f"best_score={best_score:.4f}, best_feas={best_feas}")
+
+# usar a solução melhorada (ou manter original se não melhorou)
+if len(best_assignments):
+    df_assignments = best_assignments.copy()
+else:
+    print("No better solution found; keeping constructive solution.")
+
+
+#NEW
+# rebuild df_capacity and df_surgeon_load from the final df_assignments
+# reset df_capacity free_min
+df_capacity = df_rooms.copy()
+df_capacity["free_min"] = df_capacity["available"].apply(lambda a: C_PER_SHIFT if a == 1 else 0)
+
+# subtract used minutes per block
+if len(df_assignments):
+    used_by_block = df_assignments.groupby(["room","day","shift"], as_index=False).agg(used_min=("used_min","sum"))
+    for _, r in used_by_block.iterrows():
+        idx = (df_capacity["room"]==int(r["room"])) & (df_capacity["day"]==int(r["day"])) & (df_capacity["shift"]==int(r["shift"]))
+        df_capacity.loc[idx, "free_min"] -= int(r["used_min"])
+
+# rebuild surgeon load
+df_surgeon_load = df_surgeons[["surgeon_id","day","shift"]].drop_duplicates().assign(used_min=0)
+if len(df_assignments):
+    sload = df_assignments.groupby(["surgeon_id","day","shift"], as_index=False).agg(used_min=("used_min","sum"))
+    for _, r in sload.iterrows():
+        idx_s = (df_surgeon_load["surgeon_id"]==int(r["surgeon_id"])) & (df_surgeon_load["day"]==int(r["day"])) & (df_surgeon_load["shift"]==int(r["shift"]))
+        df_surgeon_load.loc[idx_s, "used_min"] = int(r["used_min"])
 
 
 # --------------------------------------------
@@ -631,41 +871,52 @@ print(f"\nExcel exported → {xlsx_path}")
 
 
 # ---------- 8) TEXT-BASED SCHEDULE (formato B_r_d_s + linhas) ----------
-print("\n================= FINAL TEXT SCHEDULE (Scenario 2) =================\n")
+
+
+print("\n==================== FINAL SCHEDULE — FORMATTED ====================\n")
 
 if len(assignments_enriched) == 0:
     print("(No assignments found — nothing to display.)")
 else:
     INCLUDE_CLEANUP_IN_TIMELINE = True
 
-    # ordenar para que os casos dentro de cada bloco fiquem na ordem certa
+    # Ordenar blocos e casos
     assignments_sorted = assignments_enriched.sort_values(
-        ["room", "day", "shift", "seq_in_block", "iteration"]
+        ["day", "shift", "room", "seq_in_block"]
     )
 
-    blocks_text = []
-    for (r, d, sh), group in assignments_sorted.groupby(["room", "day", "shift"], sort=True):
-        t = 0
-        lines = []
+    last_block = None
+
+    for (r, d, sh), group in assignments_sorted.groupby(
+        ["room", "day", "shift"], sort=True
+    ):
+
+        # Novo bloco → print header
+        print(f"\n----------------------------------------------------------------")
+        print(f" Block B_{int(r)}_{int(d)}_{int(sh)}  (Room={r}, Day={d}, Shift={sh})")
+        print(f"----------------------------------------------------------------")
+
+        t = 0  # timeline accumulator
+
+        # Tabela bonitinha
+        print(f"{'Patient':>8} | {'Surgeon':>8} | {'Dur':>5} | {'Start':>5} | {'End':>5}")
+        print("-" * 45)
+
         for _, row in group.iterrows():
             pid = int(row["patient_id"])
             sid = int(row["surgeon_id"])
             dur = int(row["duration"])
+
             start = t
             end = t + dur
-            lines.append(f"   (p={pid}, s={sid}, dur={dur}, start={start}, end={end})")
+
+            print(f"{pid:>8} | {sid:>8} | {dur:>5} | {start:>5} | {end:>5}")
+
             t = end + (CLEANUP if INCLUDE_CLEANUP_IN_TIMELINE else 0)
 
-        header = f"B_{int(r)}_{int(d)}_{int(sh)}:"
-        block_txt = header + "\n" + "\n".join(lines)
-        blocks_text.append(block_txt)
+    print("\n====================================================================\n")
 
-    schedule_text = "\n\n".join(blocks_text)
-    print(schedule_text)
-    Path("schedule_text_output_s2.txt").write_text(schedule_text, encoding="utf-8")
-    print("\nSchedule saved to: schedule_text_output_s2.txt")
 
-print("\n====================================================================\n")
 
 
 # --------------------------------------------
