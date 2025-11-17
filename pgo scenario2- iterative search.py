@@ -287,7 +287,7 @@ def evaluate_schedule(assignments, patients, rooms_free, weights=(0.4, 0.3, 0.2,
             "norm_wait_term":float(norm_wait_term)}
 
 
-# LOCAL SEARCH NEW
+# iterative LOCAL SEARCH NEW
 import random
 
 def candidate_blocks_for_patient_in_solution(assignments, patient_row,
@@ -335,13 +335,13 @@ def candidate_blocks_for_patient_in_solution(assignments, patient_row,
 
 def swap_with_unassigned_random(assignments, patients, df_rooms, df_surgeons, C_PER_SHIFT):
     if assignments.empty:
-        return assignments, False
+        return assignments, False, None
 
     new_assign = assignments.copy()
     scheduled_ids = set(new_assign["patient_id"])
     unassigned = patients[~patients["patient_id"].isin(scheduled_ids)]
     if unassigned.empty:
-        return assignments, False
+        return assignments, False, None
 
     # escolher NÃO agendado aleatório
     u_row = unassigned.sample(1).iloc[0]
@@ -349,48 +349,55 @@ def swap_with_unassigned_random(assignments, patients, df_rooms, df_surgeons, C_
     u_sid = int(u_row["surgeon_id"])
     need = int(u_row["duration"]) + CLEANUP
 
-    surg_ok = df_surgeons[(df_surgeons["surgeon_id"] == u_sid) & (df_surgeons["available"] == 1)][["day","shift"]]
+    surg_ok = df_surgeons[(df_surgeons["surgeon_id"] == u_sid)
+                          & (df_surgeons["available"] == 1)][["day","shift"]]
 
     rooms_base = df_rooms[["room","day","shift","available"]].copy()
     rooms_base["cap_min"] = rooms_base["available"] * C_PER_SHIFT
 
-    used_by_block = new_assign.groupby(["room","day","shift"], as_index=False).agg(used_min=("used_min","sum"))
-    rooms_join = rooms_base.merge(used_by_block, on=["room","day","shift"], how="left").fillna({"used_min": 0})
+    if len(new_assign):
+        used_by_block = new_assign.groupby(["room","day","shift"],
+                                           as_index=False).agg(used_min=("used_min","sum"))
+    else:
+        used_by_block = rooms_base[["room","day","shift"]].copy()
+        used_by_block["used_min"] = 0
+
+    rooms_join = rooms_base.merge(used_by_block,
+                                  on=["room","day","shift"],
+                                  how="left").fillna({"used_min": 0})
     rooms_join["free_min"] = (rooms_join["cap_min"] - rooms_join["used_min"]).clip(lower=0)
 
-    cand_blocks = surg_ok.merge(rooms_join[rooms_join["available"]==1][["room","day","shift","used_min","cap_min","free_min"]],
-                                on=["day","shift"], how="inner")
+    cand_blocks = surg_ok.merge(
+        rooms_join[rooms_join["available"]==1][["room","day","shift","used_min","cap_min","free_min"]],
+        on=["day","shift"], how="inner")
+
     if cand_blocks.empty:
-        return assignments, False
+        return assignments, False, None
 
     # escolher bloco aleatório
     b = cand_blocks.sample(1).iloc[0]
     r, d, sh = int(b["room"]), int(b["day"]), int(b["shift"])
 
-    in_block = new_assign[(new_assign["room"]==r) & (new_assign["day"]==d) & (new_assign["shift"]==sh)].merge(
-        patients[["patient_id","priority","waiting","duration"]], on="patient_id", how="left"
-    )
+    in_block = new_assign[(new_assign["room"]==r)
+                          & (new_assign["day"]==d)
+                          & (new_assign["shift"]==sh)].merge(
+                              patients[["patient_id","priority","waiting","duration"]],
+                              on="patient_id", how="left")
 
     if in_block.empty:
-        return assignments, False
+        return assignments, False, None
 
+    # escolher OUT
     out_row = in_block.sample(1).iloc[0]
     out_id = int(out_row["patient_id"])
     out_dur = int(out_row["duration"]) + CLEANUP
 
-    used_now = int(b["used_min"])
-    cap = int(b["cap_min"])
-    if used_now - out_dur + need > cap:
-        return assignments, False
-    print(
-    f"[LS] Swap tentado: OUT P{out_id} (dur={out_dur})  ←→  "
-    f"IN P{u_id} (dur={need})  "
-    f"no bloco B_{r}_{d}_{sh}"
-)
+    if int(b["used_min"]) - out_dur + need > int(b["cap_min"]):
+        return assignments, False, None
 
-    
-    # apply change
+    # aplicar mudança REAL
     new_assign = new_assign[new_assign["patient_id"] != out_id].copy()
+
     new_assign = pd.concat([
         new_assign,
         pd.DataFrame([{
@@ -407,7 +414,10 @@ def swap_with_unassigned_random(assignments, patients, df_rooms, df_surgeons, C_
     ], ignore_index=True)
 
     new_assign = new_assign.sort_values(["day","shift","room","iteration"]).reset_index(drop=True)
-    return new_assign, True
+
+    # devolvemos informação completa e correta
+    return new_assign, True, (u_id, out_id, r, d, sh)
+
 
 
 def local_search_iterated(assign_init, df_rooms, df_surgeons, patients, C_PER_SHIFT, max_no_improv=200):
@@ -440,7 +450,7 @@ def local_search_iterated(assign_init, df_rooms, df_surgeons, patients, C_PER_SH
     while no_improv < max_no_improv:
         ls_iter += 1
 
-        candidate, moved = swap_with_unassigned_random(current, patients, df_rooms, df_surgeons, C_PER_SHIFT)
+        candidate, moved, swap_info = swap_with_unassigned_random(current, patients, df_rooms, df_surgeons, C_PER_SHIFT)
         if not moved:
             no_improv += 1
             continue
@@ -463,17 +473,19 @@ def local_search_iterated(assign_init, df_rooms, df_surgeons, patients, C_PER_SH
         else:
             cand_score = -feas_c["feasibility_score"]
 
-        # este é o print do Cenário 1
-        print(f"LS ITER {ls_iter:03d} — score {best_score:.4f} → {cand_score:.4f}")
 
         if cand_score > best_score:
+            print(f"[LS] MELHORIA: {best_score:.4f} → {cand_score:.4f}")
+            # NEW
+            u_id, out_id, r_sw, d_sw, sh_sw = swap_info
+            print(f"   movimento: OUT P{out_id}  ←→  IN P{u_id}  no bloco B_{r_sw}_{d_sw}_{sh_sw}")
+
             print("   ✓ melhoria — movimento aceite")
             current = candidate
             best_score = cand_score
             best_feas = feas_c["feasibility_score"]
             no_improv = 0
         else:
-            print("   ✗ não melhora — rejeitado")
             no_improv += 1
 
     print(f"\nLS END — melhor score={best_score:.4f}")
