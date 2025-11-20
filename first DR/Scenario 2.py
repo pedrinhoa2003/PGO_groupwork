@@ -293,7 +293,7 @@ def feasibility_metrics(assignments, df_rooms, df_surgeons, patients, C_PER_SHIF
         "rooms_cap_join": rooms_join
     }
 
-def evaluate_schedule(assignments, patients, rooms_free,excess_block_min, weights=(0.4, 0.3, 0.2, 0.1)):
+def evaluate_schedule(assignments, patients, rooms_free, excess_block_min, weights=(0.4, 0.3, 0.2, 0.1)):
     w1, w2, w3, w4 = weights
     total_patients = len(patients)
     ratio_scheduled = (len(assignments) / total_patients) if total_patients else 0.0
@@ -302,7 +302,7 @@ def evaluate_schedule(assignments, patients, rooms_free,excess_block_min, weight
 
     if len(assignments):
         merged = assignments.merge(
-            patients[["patient_id","priority","waiting"]],
+            patients[["patient_id",]],
             on="patient_id", how="left"
         )
         prio_rate = float((merged["priority"] > 0).mean())
@@ -934,18 +934,27 @@ else:
 
 
 # --------------------------------------------
-# RUN FEASIBILITY + EVALUATION ON FINAL SOLUTION 
+# RUN FEASIBILITY + EVALUATION ON initial SOLUTION 
 # --------------------------------------------
 feas = feasibility_metrics(
-    assignments=df_assignments,
+    assignments=assignments_seq_view,   
     df_rooms=df_rooms,
     df_surgeons=df_surgeons,
     patients=df_patients,
     C_PER_SHIFT=C_PER_SHIFT
 )
 
+
 # ------- SCORE INICIAL -------
-initial_eval = evaluate_schedule(df_assignments, df_patients, df_room_free, feas["excess_block_min"])
+
+initial_eval = evaluate_schedule(
+    assignments=assignments_seq_view,
+    patients =df_patients,
+    rooms_free=df_room_free,
+    excess_block_min=feas["excess_block_min"],
+)
+
+
 
 print("\nINITIAL SCORE DETAILS:")
 print("  score =", initial_eval["score"])
@@ -957,6 +966,13 @@ print("  excess_block_min =", feas["excess_block_min"])
 
 
 
+
+
+
+
+
+
+"""
 # ------- FINAL SCORE -------
 final_eval = evaluate_schedule(df_assignments, df_patients, df_room_free, feas["excess_block_min"])
 
@@ -998,4 +1014,4 @@ eval_df = pd.DataFrame([_eval_row])
 from openpyxl import load_workbook  # só para garantir que o engine existe
 
 with pd.ExcelWriter(xlsx_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-    eval_df.to_excel(writer, sheet_name="Feasibility_Eval", index=False)
+    eval_df.to_excel(writer, sheet_name="Feasibility_Eval", index=False)  """
