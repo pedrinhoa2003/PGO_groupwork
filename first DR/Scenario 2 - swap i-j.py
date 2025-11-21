@@ -293,7 +293,7 @@ def feasibility_metrics(assignments, df_rooms, df_surgeons, patients, C_PER_SHIF
         "rooms_cap_join": rooms_join
     }
 
-def evaluate_schedule(assignments, patients, rooms_free, excess_block_min, weights=(0.4, 0.3, 0.2, 0.1)):
+def evaluate_schedule(assignments, patients, rooms_free, excess_block_min, weights=(0.6, 0.1, 0.25, 0.05)):
     w1, w2, w3, w4 = weights
     total_patients = len(patients)
     ratio_scheduled = (len(assignments) / total_patients) if total_patients else 0.0
@@ -444,78 +444,61 @@ def candidate_blocks_for_patient_in_solution(assignments, patient_row,
     # NOTE: **NO ROOM-LOCK**: we intentionally do NOT restrict to same room
     return cand
 
-def sequence_global_by_surgeon(assignments_enriched, C_PER_SHIFT, CLEANUP, TOLERANCE):
- 
+def sequence_global_by_surgeon(assignments_enriched, C_PER_SHIFT, CLEANUP, TOLERANCE, ROOM_CHANGE_TIME):
     if assignments_enriched.empty:
         return assignments_enriched.copy()
 
     df = assignments_enriched.copy()
 
-    # garantir tipos
     df["room"] = df["room"].astype(int)
     df["day"] = df["day"].astype(int)
     df["shift"] = df["shift"].astype(int)
     df["surgeon_id"] = df["surgeon_id"].astype(int)
     df["duration"] = df["duration"].astype(int)
 
-    # índice original para mapear depois
     df = df.reset_index().rename(columns={"index": "orig_idx"})
 
     start_min = {}
     end_min = {}
     seq_in_block = {}
-    scheduled_flag = {}   # 1 se foi agendada no sequenciamento, 0 se foi retirada
+    scheduled_flag = {}
 
-    # trabalhar por (day, shift)
     for (day, shift), df_ds in df.groupby(["day", "shift"], sort=False):
 
-        # --- 1) construir filas por sala (na ordem desejada) ---
-        room_queues = {}  # room -> lista de orig_idx
+        # construir filas por sala (como já tinhas)
+        room_queues = {}
         for room, df_room in df_ds.groupby("room", sort=False):
             df_room = df_room.copy()
-
-            # stats por cirurgião nesta sala
             surg_stats = (
                 df_room.groupby("surgeon_id", as_index=False)
-                       .agg(
-                           total_dur=("duration", "sum"),
-                           n_cases=("patient_id", "count")
-                       )
-            )
-
-            # cirurgiões com maior carga primeiro
-            surg_stats = surg_stats.sort_values(
-                by=["total_dur", "n_cases"],
-                ascending=[False, False]
-            )
+                       .agg(total_dur=("duration","sum"),
+                            n_cases=("patient_id","count"))
+            ).sort_values(["total_dur","n_cases"], ascending=[False,False])
 
             ordered_list = []
             for _, srow in surg_stats.iterrows():
                 sid = srow["surgeon_id"]
                 sub = df_room[df_room["surgeon_id"] == sid].copy()
-                # dentro do cirurgião: cirurgias mais curtas primeiro
                 sub = sub.sort_values("duration", ascending=True)
                 ordered_list.append(sub)
-
             if ordered_list:
                 df_room_ordered = pd.concat(ordered_list, ignore_index=True)
                 room_queues[room] = list(df_room_ordered["orig_idx"].values)
             else:
                 room_queues[room] = []
 
-        # relógios de sala e cirurgião neste (day,shift)
+        # relógios
         t_room = {room: 0 for room in room_queues.keys()}
         t_surg = {sid: 0 for sid in df_ds["surgeon_id"].unique()}
+        last_room_for_surg = {sid: None for sid in df_ds["surgeon_id"].unique()}
         seq_counter = {room: 0 for room in room_queues.keys()}
 
         remaining = sum(len(q) for q in room_queues.values())
 
-        # --- 2) scheduling global ---
         while remaining > 0:
             best = None
             best_start = None
 
-            # candidatos = primeira cirurgia de cada fila de room
             for room, queue in room_queues.items():
                 if not queue:
                     continue
@@ -525,30 +508,34 @@ def sequence_global_by_surgeon(assignments_enriched, C_PER_SHIFT, CLEANUP, TOLER
                 sid = row["surgeon_id"]
                 dur = int(row["duration"])
 
-                earliest = max(t_room[room], t_surg[sid])
+                room_ready = t_room[room]      # sala livre (incluindo limpeza)
+                base_surg_ready = t_surg[sid]  # cirurgião livre (incluindo limpeza anterior)
+
+                # --- penalização de mudança de sala ---
+                if last_room_for_surg[sid] is not None and last_room_for_surg[sid] != room:
+                    surgeon_ready_with_move = base_surg_ready + ROOM_CHANGE_TIME
+                else:
+                    surgeon_ready_with_move = base_surg_ready
+
+                earliest = max(room_ready, surgeon_ready_with_move)
                 end_candidate = earliest + dur + CLEANUP
 
-                # vamos escolher o candidato com menor earliest
                 if (best is None) or (earliest < best_start - 1e-9):
-                    best = (room, idx, sid, dur, end_candidate)
+                    best = (room, idx, sid, dur, end_candidate, earliest)
                     best_start = earliest
 
             if best is None:
                 break
 
-            room, idx, sid, dur, end_candidate = best
-            earliest = best_start
+            room, idx, sid, dur, end_candidate, earliest = best
 
-            # 2A) se esta cirurgia fizer a sala ultrapassar C_PER_SHIFT + TOLERANCE,
-            #     RETIRAMOS a cirurgia (não é agendada neste turno)
+            # limite do turno + tolerância
             if end_candidate > C_PER_SHIFT + TOLERANCE + 1e-6:
-                scheduled_flag[idx] = 0  # retirada
-                # removemos da fila desse room e NÃO atualizamos relógios
+                scheduled_flag[idx] = 0
                 room_queues[room].pop(0)
                 remaining -= 1
                 continue
 
-            # 2B) caso contrário, agendamos normalmente
             start = earliest
             end = end_candidate
 
@@ -558,26 +545,21 @@ def sequence_global_by_surgeon(assignments_enriched, C_PER_SHIFT, CLEANUP, TOLER
             seq_in_block[idx] = seq_counter[room]
             scheduled_flag[idx] = 1
 
-            # atualizar relógios
             t_room[room] = end
             t_surg[sid] = end
+            last_room_for_surg[sid] = room
 
-            # tirar da fila
             room_queues[room].pop(0)
             remaining -= 1
 
-        # opcional: podes inspecionar t_room aqui se quiseres
-
-    # mapear de volta para o DF
     df["start_min"] = df["orig_idx"].map(start_min)
     df["end_min"] = df["orig_idx"].map(end_min)
     df["seq_in_block"] = df["orig_idx"].map(seq_in_block)
     df["scheduled_by_seq"] = df["orig_idx"].map(scheduled_flag).fillna(0).astype(int)
 
-    # remover coluna técnica
-    df = df.drop(columns=["orig_idx"])
+    return df.drop(columns=["orig_idx"])
 
-    return df
+
 
 def build_room_free_from_assignments(assignments, df_rooms, C_PER_SHIFT):
     # base: capacidade dos blocos
@@ -799,7 +781,8 @@ assignments_enriched = sequence_global_by_surgeon(
     assignments_enriched,
     C_PER_SHIFT=C_PER_SHIFT,
     CLEANUP=CLEANUP,
-    TOLERANCE=TOLERANCE
+    TOLERANCE=TOLERANCE,
+    ROOM_CHANGE_TIME=ROOM_CHANGE_TIME
 )
 
 assignments_seq_view = assignments_enriched[
@@ -874,7 +857,8 @@ def full_evaluation(assignments):
         enriched,
         C_PER_SHIFT=C_PER_SHIFT,
         CLEANUP=CLEANUP,
-        TOLERANCE=TOLERANCE
+        TOLERANCE=TOLERANCE,
+        ROOM_CHANGE_TIME=ROOM_CHANGE_TIME
     )
 
     seq = enriched[enriched["scheduled_by_seq"]==1].copy()
@@ -964,7 +948,8 @@ best_assignments_enriched = sequence_global_by_surgeon(
     best_assignments_enriched,
     C_PER_SHIFT=C_PER_SHIFT,
     CLEANUP=CLEANUP,
-    TOLERANCE=TOLERANCE
+    TOLERANCE=TOLERANCE,
+    ROOM_CHANGE_TIME=ROOM_CHANGE_TIME
 )
 
 # 3) Cirurgias que ficam na solução final
@@ -1251,14 +1236,6 @@ best_eval = evaluate_schedule(
 
 
 
-
-print("\nINITIAL SCORE DETAILS:")
-print("  score =", initial_eval["score"])
-print("  ratio_scheduled =", initial_eval["ratio_scheduled"])
-print("  util_rooms =", initial_eval["util_rooms"])
-print("  prio_rate =", initial_eval["prio_rate"])
-print("  norm_wait_term =", initial_eval["norm_wait_term"])
-print("  excess_block_min =", feas["excess_block_min"])
 
 
 
