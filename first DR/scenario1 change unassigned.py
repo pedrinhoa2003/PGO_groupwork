@@ -505,9 +505,12 @@ def swap_patients(assignments, patients, df_rooms, df_surgeons, C_PER_SHIFT):
         print("✅ Blocos diferentes → pode fazer swap.")
 
         # 3) aplicar swap
-        new_assign.loc[new_assign["patient_id"] == pid1, ["room", "day", "shift"]] = row2.values
-        new_assign.loc[new_assign["patient_id"] == pid2, ["room", "day", "shift"]] = row1.values
-
+        new_assign.loc[new_assign["patient_id"] == pid1, ["room", "day", "shift"]] = (
+            row2["room"], row2["day"], row2["shift"]
+        )
+        new_assign.loc[new_assign["patient_id"] == pid2, ["room", "day", "shift"]] = (
+            row1["room"], row1["day"], row1["shift"]
+        )
         print(f"✔️ Swap efetuado:")
         print(f"   P{pid1} → (R{row2['room']},D{row2['day']},S{row2['shift']})")
         print(f"   P{pid2} → (R{row1['room']},D{row1['day']},S{row1['shift']})")
@@ -821,7 +824,7 @@ def local_search(assign_init, df_rooms, df_surgeons, patients,
             continue
         else:
             print(f"\n--- Iter {no_improv}: tentando vizinhança {move_type}")
-            print(f"Candidate: {candidate}")
+            #print(f"Candidate: {candidate}")
         
         
 
@@ -860,7 +863,7 @@ def local_search(assign_init, df_rooms, df_surgeons, patients,
             best_rooms_join = rooms_join_c
             no_improv = 0
         else:
-            print(" --> não melhorou")
+            #print(" --> não melhorou")
             no_improv += 1
 
     return current, best_score, best_feas
@@ -972,7 +975,7 @@ while True:
           f"(Room={int(best_block['room'])}, Day={int(best_block['day'])}, Shift={int(best_block['shift'])}), "
           f"W_patient={patient_row['W_patient']:.4f}, W_block={best_block['W_block']:.3f}")
 
-print("\nFinal assignments:")
+#print("\nFinal assignments:")
 
 feas_init = feasibility_metrics(df_assignments, df_rooms, df_surgeons, df_patients, C_PER_SHIFT)
 
@@ -1016,8 +1019,24 @@ best_assignments, best_score, best_feas = local_search(
     max_no_improv=200
 )
 
-print("\nAssignments depois da LOCAL SEARCH:")
-print(best_assignments)
+# garantir que as chaves são int
+best_assignments["patient_id"] = best_assignments["patient_id"].astype(int)
+df_patients["patient_id"] = df_patients["patient_id"].astype(int)
+
+
+final_print = best_assignments.merge(
+    df_patients[["patient_id", "priority", "duration"]],
+    on="patient_id",
+    how="left"
+).sort_values(["day", "shift", "room", "iteration"])
+
+for _, row in final_print.iterrows():
+    print(
+        f"B{row['room']}_{row['day']}_{row['shift']} "
+        f"(p={row['patient_id']}, "
+        f"s={row['surgeon_id']}, "
+        f"dur={row['duration']})"
+    )
 print(f"Score final = {best_score:.4f}, feasibility_score = {best_feas}")
 
 
@@ -1045,8 +1064,8 @@ df_surgeon_free["utilization"] = df_surgeon_free.apply(
 
 df_surgeon_free = df_surgeon_free.sort_values(["surgeon_id", "day", "shift"]).reset_index(drop=True)
 
-print("\nSurgeons — remaining free minutes per day/shift:")
-print(df_surgeon_free.head(12))
+#print("\nSurgeons — remaining free minutes per day/shift:")
+#print(df_surgeon_free.head(12))
 
 
 # --------------------------------------------
@@ -1064,8 +1083,8 @@ df_room_free["utilization"] = df_room_free.apply(
 
 df_room_free = df_room_free.sort_values(["room", "day", "shift"]).reset_index(drop=True)
 
-print("\nRooms — remaining free minutes per day/shift:")
-print(df_room_free.head(12))
+#print("\nRooms — remaining free minutes per day/shift:")
+#print(df_room_free.head(12))
 
 
 # ============================================================
@@ -1100,7 +1119,7 @@ surgeons_av_matrix = inputs_surgeons.pivot_table(
 # ---------- 2) Assignments enriched ----------
 # Join extra patient info to assignments
 assignments_enriched = best_assignments.merge(
-    df_patients[["patient_id", "surgeon_id", "duration", "priority", "waiting"]],
+    df_patients[["patient_id", "duration", "priority", "waiting"]],
     on="patient_id", how="left"
 ).sort_values("iteration")
 
