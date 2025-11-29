@@ -77,7 +77,7 @@ df_patients = pd.DataFrame({
     "duration": durations,
     "priority": priorities,
     "waiting": waitings,
-    "surgeon_id": surgeons
+    "surgeon_id": surgeons             
 })
 
 # Rooms
@@ -371,7 +371,7 @@ def evaluate_schedule(assignments, patients, rooms_free, excess_block_min,
 
 
 
-def generate_neighbor_swap(current_assignments,         #isto aqui já é depois do schedule???
+def generate_neighbor_swap(current_assignments,         #Swap com remoção/admissão de pacientes (swap i↔j no ILS)
                            df_patients,
                            df_rooms,
                            df_surgeons,
@@ -382,6 +382,12 @@ def generate_neighbor_swap(current_assignments,         #isto aqui já é depois
     Gera um vizinho da solução atual e devolve também:
       - ids_out: lista de pacientes retirados
       - ids_in_effective: lista de pacientes que foram mesmo adicionados
+     
+        O algoritmo copia o agendamento atual, escolhe aleatoriamente até max_swap_out pacientes
+        já agendados para remover, embaralha a lista de não agendados e tenta inserir até max_swap_in deles. 
+        Para cada novo paciente candidato, calcula blocos viáveis com candidate_blocks_for_patient_in_solution, 
+        sorteia um bloco, cria um novo registo e concatena ao dataframe, registrando quem saiu (ids_out) e quem entrou de facto (ids_in_effective).
+      
     """
 
     # cópia para não estragar o original
@@ -452,6 +458,14 @@ def generate_neighbor_swap(current_assignments,         #isto aqui já é depois
 
 
 import random
+
+
+"""
+Cálculo dos blocos viáveis para inserir um paciente
+A função candidate_blocks_for_patient_in_solution (ver a seguir) verifica disponibilidade do cirurgião e das salas,
+subtrai a carga já usada para obter free_min, e filtra apenas blocos onde o tempo necessário (duração + limpeza) cabe tanto na sala quanto no limite do cirurgião. 
+O resultado é a lista de (room, day, shift) possíveis usada pelo swap anterior
+"""
 
 def candidate_blocks_for_patient_in_solution(assignments, patient_row,
                                              df_rooms, df_surgeons, C_PER_SHIFT):
@@ -701,6 +715,12 @@ def full_evaluation_from_enriched(enriched_assignments):
 
     return ev["score"], seq, rooms_free, feas, enriched
 
+"""
+No generate_neighbor_resequence (em baixo), o movimento não troca pacientes de bloco; 
+apenas altera a coluna order_hint para alguns blocos com pelo menos dois casos. 
+Ele garante uma ordem base, escolhe blocos aleatórios, e dentro de cada um faz swaps de order_hint entre pares aleatórios de cirurgias para mudar a sequência de execução, retornando também um log do “antes/depois
+"""
+
 def generate_neighbor_resequence(current_enriched,
                                  max_blocks_to_change=1,
                                  swaps_per_block=1):
@@ -773,6 +793,12 @@ def generate_neighbor_resequence(current_enriched,
         })
 
     return neigh, change_log
+
+"""
+A função em baixo seleciona dois casos distintos que estejam no mesmo dia e turno, mas em salas diferentes. 
+Depois simplesmente troca o número da sala entre eles, preservando dia e turno, e devolve o vizinho com informações do swap aplicado. 
+É um movimento 1–por–1, pensado para manter quase sempre a viabilidade temporal dos blocos
+"""
 
 def generate_neighbor_cross_room_swap(current_assignments):
     """

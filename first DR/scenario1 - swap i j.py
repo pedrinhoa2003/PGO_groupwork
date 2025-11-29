@@ -591,7 +591,10 @@ while True:
     # progress log
  
 feas_init = feasibility_metrics(df_assignments, df_rooms, df_surgeons, df_patients, C_PER_SHIFT)
-score_init = evaluate_schedule(df_assignments, df_patients, feas_init["rooms_join"])
+score_init = evaluate_schedule(df_assignments, df_patients, feas_init["rooms_cap_join"], feas_init["excess_block_min"])
+
+#def evaluate_schedule(assignments, patients, rooms_free, excess_block_min,        só para perceber como sao os inputs
+                     # weights=(0.6, 0.1, 0.25, 0.05)):
 
 assigned_ids = set(df_assignments["patient_id"])
 unassigned_patients = df_patients[~df_patients["patient_id"].isin(assigned_ids)].copy()
