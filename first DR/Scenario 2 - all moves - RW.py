@@ -5,11 +5,18 @@ Scenario 2: Surgeon can change room within the same shift
 Author: Joana
 """
 
+
 from pathlib import Path
 import re
 import ast
 import itertools
 import pandas as pd
+import random
+import numpy as np
+import math
+# Fix seeds
+random.seed(42)
+np.random.seed(42)
 
 # ------------------------------
 # PARAMETERS
@@ -1221,6 +1228,123 @@ def full_evaluation(assignments):
 
     return ev["score"], seq, rooms_free, feas, enriched
 
+def random_walk_from_solution(start_assignments,
+                              n_steps=10,
+                              max_swap_out=2,
+                              max_swap_in=2,
+                              max_add=2):
+    """
+    Aplica uma random walk sobre a solução de partida:
+      - em cada passo escolhe ALEATORIAMENTE um tipo de movimento
+        (swap, add-only, cross-room)
+      - aceita sempre o vizinho se for válido (não precisa melhorar)
+    Devolve o assignments após a perturbação.
+    """
+    current = start_assignments.copy()
+
+    for step in range(n_steps):
+        move_type = random.choice(["swap", "add", "cross"])
+
+        if move_type == "swap":
+            neighbor, ids_out, ids_in = generate_neighbor_swap(
+                current,
+                df_patients,
+                df_rooms,
+                df_surgeons,
+                C_PER_SHIFT,
+                max_swap_out=max_swap_out,
+                max_swap_in=max_swap_in
+            )
+            current = neighbor.copy()
+
+        elif move_type == "add":
+            neighbor, ids_in = generate_neighbor_add_only(
+                current,
+                df_patients,
+                df_rooms,
+                df_surgeons,
+                C_PER_SHIFT,
+                max_add=max_add
+            )
+            if ids_in:   # só aceitamos se realmente acrescentou alguém
+                current = neighbor.copy()
+
+        else:  # "cross"
+            neighbor, swap_info = generate_neighbor_cross_room_swap(current)
+            if swap_info is not None:   # swap válido
+                current = neighbor.copy()
+
+    return current
+
+
+def local_search_from(start_assignments,
+                      n_iter_swap=40,
+                      n_iter_add=20):
+    """
+    Pequena busca local:
+      1) ILS-like com vizinhos swap (first improvement)
+      2) ILS-like com vizinhos add-only
+    Devolve a melhor solução encontrada e o seu score.
+    """
+    current_assignments = start_assignments.copy()
+    current_score, current_seq, current_rooms_free, current_feas, _ = \
+        full_evaluation(current_assignments)
+
+    best_assignments = current_assignments.copy()
+    best_score = current_score
+
+    # --- FASE SWAP ---
+    for it in range(n_iter_swap):
+        neighbor, ids_out, ids_in = generate_neighbor_swap(
+            current_assignments,
+            df_patients,
+            df_rooms,
+            df_surgeons,
+            C_PER_SHIFT,
+            max_swap_out=2,
+            max_swap_in=2
+        )
+        neigh_score, neigh_seq, neigh_rooms_free, neigh_feas, _ = \
+            full_evaluation(neighbor)
+
+        if neigh_score > current_score:
+            current_assignments = neighbor.copy()
+            current_score = neigh_score
+
+            if neigh_score > best_score:
+                best_score = neigh_score
+                best_assignments = neighbor.copy()
+
+    # --- FASE ADD-ONLY ---
+    current_assignments = best_assignments.copy()
+    current_score = best_score
+
+    for it in range(n_iter_add):
+        neighbor, ids_added = generate_neighbor_add_only(
+            current_assignments,
+            df_patients,
+            df_rooms,
+            df_surgeons,
+            C_PER_SHIFT,
+            max_add=2
+        )
+        if not ids_added:
+            continue
+
+        neigh_score, neigh_seq, neigh_rooms_free, neigh_feas, _ = \
+            full_evaluation(neighbor)
+
+        if neigh_score > current_score:
+            current_assignments = neighbor.copy()
+            current_score = neigh_score
+
+            if neigh_score > best_score:
+                best_score = neigh_score
+                best_assignments = neighbor.copy()
+
+    return best_assignments, best_score
+
+
 
 # Avaliar solução inicial
 current_score, current_seq, current_rooms_free, current_feas, _ = full_evaluation(current_assignments)
@@ -1514,7 +1638,88 @@ for it in range(N_ILS4_ITER):
 print("\n========== END OF ILS #4 ==========\n")
 
 # atualizar solução final com o melhor da ILS4
-best_assignments = best_assignments_4.copy()
+#best_assignments = best_assignments_4.copy()
+#best_assignments_enriched = best_assignments.merge(
+#    df_patients[["patient_id","duration","priority","waiting"]],
+#    on="patient_id",
+#    how="left"
+#)
+#best_assignments_enriched = sequence_global_by_surgeon(
+#    best_assignments_enriched,
+#    C_PER_SHIFT=C_PER_SHIFT,
+#    CLEANUP=CLEANUP,
+#    TOLERANCE=TOLERANCE,
+#    ROOM_CHANGE_TIME=ROOM_CHANGE_TIME
+#)
+#best_assignments_seq = best_assignments_enriched[
+#    best_assignments_enriched["scheduled_by_seq"] == 1
+#].sort_values(["day","shift","room","seq_in_block"]).reset_index(drop=True)
+
+#best_rooms_free = build_room_free_from_assignments(
+#    assignments=best_assignments_seq,
+#    df_rooms=df_rooms,
+#    C_PER_SHIFT=C_PER_SHIFT
+#)
+#best_surgeon_free = build_surgeon_free_from_assignments(
+#    assignments=best_assignments_seq,
+#    df_surgeons=df_surgeons,
+#    C_PER_SHIFT=C_PER_SHIFT
+#)
+
+#assignments_enriched = best_assignments_enriched.copy()
+#assignments_seq_view = best_assignments_seq.copy()
+#df_room_free = best_rooms_free.copy()
+#df_surgeon_free = best_surgeon_free.copy()
+
+
+
+# =========================================================
+#        RANDOM WALK ON LOCAL OPTIMA (RW)
+# =========================================================
+
+print("\n\n========== STARTING RANDOM WALK ON LOCAL OPTIMA ==========\n")
+
+# ponto de partida: melhor solução depois da ILS4
+rw_best_assignments = best_assignments_4.copy()
+rw_best_score, _, _, _, _ = full_evaluation(rw_best_assignments)
+
+print(f"Score before RW: {rw_best_score:.4f}")
+
+N_RW = 5          # nº de random walks a testar
+RW_STEPS = 10     # nº de passos aleatórios por walk
+
+for rw in range(N_RW):
+    print(f"\n--- RW {rw+1}/{N_RW} ---")
+
+    # 1) perturbar solução atual (random walk)
+    start = rw_best_assignments.copy()
+    perturbed = random_walk_from_solution(
+        start,
+        n_steps=RW_STEPS,
+        max_swap_out=2,
+        max_swap_in=2,
+        max_add=2
+    )
+
+    # 2) pequena busca local a partir da solução perturbada
+    ls_best, ls_score = local_search_from(
+        perturbed,
+        n_iter_swap=40,
+        n_iter_add=20
+    )
+
+    print(f"   Local optimum after RW: {ls_score:.4f}")
+
+    # 3) actualizar melhor global, se melhorar
+    if ls_score > rw_best_score:
+        print(f"   >>> GLOBAL BEST IMPROVED: {rw_best_score:.4f} -> {ls_score:.4f}")
+        rw_best_score = ls_score
+        rw_best_assignments = ls_best.copy()
+
+print("\n========== END OF RANDOM WALK PHASE ==========\n")
+
+# atualizar solução final com o melhor após RW
+best_assignments = rw_best_assignments.copy()
 best_assignments_enriched = best_assignments.merge(
     df_patients[["patient_id","duration","priority","waiting"]],
     on="patient_id",
@@ -1546,9 +1751,6 @@ assignments_enriched = best_assignments_enriched.copy()
 assignments_seq_view = best_assignments_seq.copy()
 df_room_free = best_rooms_free.copy()
 df_surgeon_free = best_surgeon_free.copy()
-
-
-
 
 
 
