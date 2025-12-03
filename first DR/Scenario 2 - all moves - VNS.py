@@ -10,13 +10,21 @@ import re
 import ast
 import itertools
 import pandas as pd
+import random 
+import numpy as np
+
+
+# Fix seeds
+random.seed(42)
+np.random.seed(42)
+
 
 # ------------------------------
 # PARAMETERS
 # ------------------------------
 
 
-DATA_FILE = "Instance_NC_30.dat"
+DATA_FILE = "Instance_C2_30.dat"
 
 
 C_PER_SHIFT = 360   # minutes per shift (6h * 60)
@@ -1221,6 +1229,141 @@ def full_evaluation(assignments):
 
     return ev["score"], seq, rooms_free, feas, enriched
 
+# ------------------------------------------------------------
+# VNS SUPPORT (evaluation + VND + General VNS orchestrator)
+# ------------------------------------------------------------
+
+def _evaluate_assignments(assignments):
+    score, seq, rooms_free, feas, enriched = full_evaluation(assignments)
+    return {
+        "assignments": assignments,
+        "score": score,
+        "seq": seq,
+        "rooms_free": rooms_free,
+        "feas": feas,
+        "enriched": enriched,
+    }
+
+
+def _run_vnd(start_assignments, neighborhoods, trials_per_neighborhood=5):
+    current = _evaluate_assignments(start_assignments)
+    l = 0
+
+    while l < len(neighborhoods):
+        name, generator = neighborhoods[l]
+        improved = False
+        best_local = current
+
+        for _ in range(trials_per_neighborhood):
+            neighbor = generator(current["assignments"])
+            if neighbor is None:
+                continue
+
+            neigh_eval = _evaluate_assignments(neighbor)
+            if neigh_eval["score"] > best_local["score"]:
+                best_local = neigh_eval
+                improved = True
+
+        if improved:
+            current = best_local
+            l = 0
+        else:
+            l += 1
+
+    return current
+
+
+def run_general_vns(start_assignments,
+                    shaking_neighborhoods,
+                    vnd_neighborhoods,
+                    rvns_samples_per_neighborhood=3,
+                    trials_per_neighborhood=5,
+                    max_no_improve=15):
+    """General VNS with RVNS seeding + VND local search."""
+
+    # 1) RVNS seeding
+    best = _evaluate_assignments(start_assignments)
+
+    for name, generator in shaking_neighborhoods:
+        for _ in range(rvns_samples_per_neighborhood):
+            neighbor = generator(start_assignments)
+            if neighbor is None:
+                continue
+
+            neigh_eval = _evaluate_assignments(neighbor)
+            if neigh_eval["score"] > best["score"]:
+                best = neigh_eval
+
+    incumbent = best
+    k = 0
+    no_improve = 0
+
+    # 2) Main VNS loop
+    while k < len(shaking_neighborhoods) and no_improve < max_no_improve:
+        name, generator = shaking_neighborhoods[k]
+        shaken = generator(incumbent["assignments"])
+
+        if shaken is None:
+            k += 1
+            no_improve += 1
+            continue
+
+        shaken_vnd = _run_vnd(
+            shaken,
+            vnd_neighborhoods,
+            trials_per_neighborhood=trials_per_neighborhood,
+        )
+
+        if shaken_vnd["score"] > incumbent["score"]:
+            incumbent = shaken_vnd
+            if shaken_vnd["score"] > best["score"]:
+                best = shaken_vnd
+
+            k = 0
+            no_improve = 0
+            print(f"[VNS] Improved to {incumbent['score']:.4f} via {name}; restart k=1")
+        else:
+            k += 1
+            no_improve += 1
+
+    return best
+
+
+# Wrappers to plug existing neighborhood generators into VNS
+def _shake_swap(assignments):
+    neighbor, _, _ = generate_neighbor_swap(
+        assignments,
+        df_patients,
+        df_rooms,
+        df_surgeons,
+        C_PER_SHIFT,
+        max_swap_out=MAX_SWAP_OUT,
+        max_swap_in=MAX_SWAP_IN,
+    )
+    return neighbor
+
+
+def _shake_add_only(assignments):
+    neighbor, added = generate_neighbor_add_only(
+        assignments,
+        df_patients,
+        df_rooms,
+        df_surgeons,
+        C_PER_SHIFT,
+        max_add=2,
+    )
+    if not added:
+        return None
+    return neighbor
+
+
+def _shake_cross_room(assignments):
+    neighbor, info = generate_neighbor_cross_room_swap(assignments)
+    if info is None:
+        return None
+    return neighbor
+
+
 
 # Avaliar solução inicial
 current_score, current_seq, current_rooms_free, current_feas, _ = full_evaluation(current_assignments)
@@ -1548,7 +1691,64 @@ df_room_free = best_rooms_free.copy()
 df_surgeon_free = best_surgeon_free.copy()
 
 
+# =========================================================
+#        GENERAL VNS ON TOP OF ILS SOLUTION
+# =========================================================
 
+print("\n\n========== STARTING GENERAL VNS (Scenario 2 - all moves) ==========\n")
+
+shaking_neighborhoods = [
+    ("swap", _shake_swap),
+    ("add_only", _shake_add_only),
+    ("cross_room", _shake_cross_room),
+]
+
+vnd_neighborhoods = [
+    ("swap", _shake_swap),
+    ("add_only", _shake_add_only),
+    ("cross_room", _shake_cross_room),
+]
+
+vns_result = run_general_vns(
+    start_assignments=best_assignments,
+    shaking_neighborhoods=shaking_neighborhoods,
+    vnd_neighborhoods=vnd_neighborhoods,
+    rvns_samples_per_neighborhood=2,
+    trials_per_neighborhood=3,
+    max_no_improve=15,
+)
+
+if vns_result["score"] > best_score:
+    print(
+        f"[VNS] Improved global score from {best_score:.4f} to "
+        f"{vns_result['score']:.4f}"
+    )
+
+    best_score = vns_result["score"]
+    best_assignments = vns_result["assignments"].copy()
+    best_assignments_enriched = vns_result["enriched"].copy()
+    best_assignments_seq = vns_result["seq"].copy()
+    best_rooms_free = vns_result["rooms_free"].copy()
+    best_feas = vns_result["feas"]
+    best_surgeon_free = build_surgeon_free_from_assignments(
+        assignments=best_assignments_seq,
+        df_surgeons=df_surgeons,
+        C_PER_SHIFT=C_PER_SHIFT,
+    )
+
+    assignments_enriched = best_assignments_enriched.copy()
+    assignments_seq_view = best_assignments_seq.copy()
+    df_room_free = best_rooms_free.copy()
+    df_surgeon_free = best_surgeon_free.copy()
+else:
+    print(
+        f"[VNS] No improvement over ILS best (score {best_score:.4f}). "
+        "Keeping ILS solution."
+    )
+
+
+
+# --------------------------------------------
 
 
 
