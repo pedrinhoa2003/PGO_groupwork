@@ -21,9 +21,6 @@ np.random.seed(42)
 # ------------------------------
 
 
-
-
-
 DATA_FILE = "Instance_NC_30.dat"
 
 
@@ -1177,7 +1174,7 @@ initial_eval = evaluate_schedule(
 
     
 # =========================================================
-#        FISRT ITERATED LOCAL SEARCH 
+#        FISRT LOCAL SEARCH 
 # =========================================================
 
 N_ILS_ITER = 100
@@ -1239,8 +1236,8 @@ best_seq = current_seq.copy()
 best_rooms_free = current_rooms_free.copy()
 best_feas = current_feas  
 
-print("\nILS START")
-print("Initial score:", current_score)
+print("\n========== LOCAL SEARCH MOVE #1 — SWAP ==========")
+print("Initial score (LS1):", current_score)
 
 for it in range(N_ILS_ITER):
 
@@ -1255,10 +1252,12 @@ for it in range(N_ILS_ITER):
         max_swap_in=MAX_SWAP_IN
     )
     
-    print(
-        f"[ILS1 Iter {it}] Agitação swap: removed={ids_out} | added={ids_in} "
-        f"| total_assignments={len(neighbor)}"
-    )
+    """print(
+        f"[LS1 It{it}] rem={ids_out} | add={ids_in} "
+        
+        f"| total_assignments={len(neighbor)}" 
+        
+    )"""
 
     neigh_score, neigh_seq, neigh_rooms_free, neigh_feas, _ = full_evaluation(neighbor)
 
@@ -1275,17 +1274,20 @@ for it in range(N_ILS_ITER):
             best_rooms_free = neigh_rooms_free.copy()
             best_feas = neigh_feas 
 
-        print(f"[Iter {it}] Improved score to {current_score:.4f} | "
-              f"removed={ids_out} | added={ids_in}")
+        print(
+            f"[LS1 Iter {it}] Accepted improvement → {current_score:.4f} "
+            f"| removed={ids_out} | added={ids_in}"
+        )
     else:
        None
        
        
 # ============================================================
-#     ILS #2 — ADD-ONLY (INSERIR SEM REMOVER)
+#      #2 — ADD-ONLY (INSERIR SEM REMOVER)
 # ============================================================
 
-print("\n\n========== STARTING ILS #2 — ADD-ONLY ==========\n")
+
+print("\n\n========== LOCAL SEARCH MOVE #2 — ADD-ONLY ==========\n")
 
 current_assignments = best_assignments.copy()
 current_score, current_seq, current_rooms_free, current_feas, _ = \
@@ -1299,7 +1301,8 @@ best_feas = current_feas
 
 N_ILS2_ITER = 50
 
-print("Initial add-only score:", current_score)
+
+print("Initial add-only score (LS2):", current_score)
 
 for it in range(N_ILS2_ITER):
 
@@ -1313,12 +1316,12 @@ for it in range(N_ILS2_ITER):
     )
 
     if not ids_added:
-        print(f"[ILS2 Iter {it}] Agitação add-only: nenhum paciente elegível para inserir.")
+       
         continue
-    print(
-        f"[ILS2 Iter {it}] Agitação add-only: candidatos_inseridos={ids_added} "
+    """print(
+        f"[LS2 Iter {it}] Avaliação vizinhança add-only: candidatos_inseridos={ids_added} "
         f"| total_assignments={len(neighbor)}"
-    )
+    )"""
 
     neigh_score, neigh_seq, neigh_rooms_free, neigh_feas, _ = \
         full_evaluation(neighbor)
@@ -1335,7 +1338,7 @@ for it in range(N_ILS2_ITER):
             best_feas = neigh_feas
 
         print(
-            f"[ILS2 Iter {it}] Improved score to {current_score:.4f} | "
+            f"[LS2 Iter {it}] Accepted improvement → {current_score:.4f} | "
             f"added={ids_added}"
         )
 
@@ -1398,7 +1401,7 @@ df_surgeon_free = best_surgeon_free.copy()
 #        ILS #3 — RESEQUENCING (mudar a ordem dentro dos blocos)
 # =========================================================
 
-print("\n\n========== STARTING ILS #2 — RESEQUENCE ==========\n")
+print("\n\n========== STARTING Local search move #3 — RESEQUENCE ==========\n")
 
 # ponto de partida = melhor solução da ILS #2
 current_enriched = assignments_enriched.copy()
@@ -1416,7 +1419,7 @@ best_seq = current_seq.copy()
 best_rooms_free = current_rooms_free.copy()
 best_feas = current_feas  
 
-print("Initial resequence score:", current_score)
+print("Initial resequence score (LS3):", current_score)
 
 N_ILS_ITER = 30  # mesmo número que tinhas
 
@@ -1428,9 +1431,9 @@ for it in range(N_ILS_ITER):
         max_blocks_to_change=1,
         swaps_per_block=1
     )
-    print(
-        f"[ILS3 Iter {it:02d}] Agitação resequence: {len(change_log)} bloco(s) tocados"
-    )
+    """print(
+        f"[LS3 Iter {it:02d}] Avaliação vizinhança resequence: {len(change_log)} bloco(s) tocados"        
+    )"""
 
     neigh_score, neigh_seq, neigh_rooms_free, neigh_feas, _ = \
         full_evaluation_from_enriched(neighbor_enriched)
@@ -1455,7 +1458,7 @@ for it in range(N_ILS_ITER):
         status = "GLOBAL_BEST" if improved_global else "LOCAL_IMPROVEMENT"
 
         print(
-            f"[ILS3 Iter {it:02d}] {status} | "
+            f"[LS3 Iter {it:02d}] {status} | "
             f"current: {old_current:.4f} -> {current_score:.4f} | "
             f"best: {old_best:.4f} -> {best_score:.4f}"
         )
@@ -1473,14 +1476,15 @@ for it in range(N_ILS_ITER):
             )
             print(f"     before: {before_str}")
             print(f"     after : {after_str}")
+            
 
-print("\n========== END OF ILS #3 ==========\n")
+print("\n========== END OF LS Move #3 ==========\n")
 
 # =========================================================
 #        ILS #3 — CROSS-ROOM SWAP (change surgeries from one room to another within the same shift )
 # =========================================================
 
-print("\n\n========== STARTING ILS #4 — CROSS-ROOM SWAP ==========\n")
+print("\n\n========== STARTING LS Move #4 — CROSS-ROOM SWAP ==========\n")
 
 # ponto de partida = melhor solução da ILS2
 current_assignments = best_assignments.copy()
@@ -1496,7 +1500,7 @@ best_rooms_free_4 = current_rooms_free.copy()
 best_feas_4 = current_feas
 
 
-print("Initial score (ILS4):", current_score)
+print("Initial score (LS4):", current_score)
 
 N_ILS4_ITER = 50
 
@@ -1505,10 +1509,10 @@ for it in range(N_ILS4_ITER):
     neighbor, swap_info = generate_neighbor_cross_room_swap(current_assignments)
 
     if swap_info is None:
-        print(f"[ILS4 Iter {it}] Agitação cross-room: nenhum swap possível.")
+        print(f"[LS4 Iter {it}] Nenhum cross-room swap possível nesta iteração.")
         continue
     print(
-        f"[ILS4 Iter {it}] Agitação cross-room: "
+        f"[LS4 Iter {it}] Avaliação vizinhança cross-room: "
         f"p{swap_info['pidA']}@room{swap_info['roomA_before']} ↔ "
         f"p{swap_info['pidB']}@room{swap_info['roomB_before']} "
         f"(day={swap_info['day']}, shift={swap_info['shift']})"
@@ -1532,14 +1536,14 @@ for it in range(N_ILS4_ITER):
 
 
         print(
-            f"[ILS4 Iter {it}] {'GLOBAL' if improved_global else 'LOCAL'} "
+            f"[LS4 Iter {it}] {'GLOBAL' if improved_global else 'LOCAL'} "
             f"score improved: {neigh_score:.4f}"
         )
         print(f"   ↪ swap p{swap_info['pidA']} ↔ p{swap_info['pidB']} "
               f"(day={swap_info['day']} shift={swap_info['shift']}) "
               f"rooms {swap_info['roomA_before']} ↔ {swap_info['roomB_before']}")
 
-print("\n========== END OF ILS #4 ==========\n")
+print("\n========== END OF LS Move #4 ==========\n")
 
 # =========================================================
 #        ILS with VNS-style shaking (unified loop)
